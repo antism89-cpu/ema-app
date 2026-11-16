@@ -1,0 +1,14 @@
+{
+  "name": "EMA 기록",
+  "short_name": "EMA",
+  "description": "필요한 항목만, 정해진 기간 동안만 기록하는 로컬 EMA 앱",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f7f5",
+  "theme_color": "#0f766e",
+  "lang": "ko",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
