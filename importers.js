@@ -140,3 +140,77 @@ function normalizeConversation(c) {
   }
   return null;
 }
+
+/* ---------- Android / generic daily CSV (Google Fit Takeout, Samsung Health, others) ---------- */
+function parseCSVText(text) {
+  const rows = [];
+  let row = [], cur = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else quoted = false; }
+      else cur += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+    else if (c !== '\r') cur += c;
+  }
+  if (cur || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+
+const isDateCol = n => /^(date|day|날짜|일자)$/.test(n) || /(^|[._])day_time$/.test(n);
+
+function csvDayKey(v) {
+  v = String(v).trim();
+  if (/^\d{10,13}$/.test(v)) {                       // epoch (Samsung day_time = UTC midnight)
+    const n = Number(v) * (v.length <= 10 ? 1000 : 1);
+    return new Date(n).toISOString().slice(0, 10);
+  }
+  const m = v.match(/^(\d{4})[-./](\d{1,2})[-./](\d{1,2})/);
+  return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : null;
+}
+
+/**
+ * Reads a one-row-per-day CSV and keeps only days in [fromKey, toKeyExcl) and the selected types.
+ * Columns are matched by header name, so it tolerates different apps and Korean/English exports.
+ */
+export async function parseHealthCSV(file, { fromKey, toKeyExcl, types, onProgress }) {
+  const table = parseCSVText((await file.text()).replace(/^﻿/, ''));
+  const norm = s => String(s).toLowerCase().trim();
+  // Samsung Health files carry a one-line descriptor before the real header row.
+  const hi = table.findIndex(r => r.some(c => isDateCol(norm(c))));
+  if (hi < 0) throw new Error('no-columns');
+  const head = table[hi].map(norm);
+  const col = re => head.findIndex(n => re.test(n));
+  const cDate = head.findIndex(isDateCol);
+  const cols = {
+    steps: types.includes('steps') ? col(/step.?count|^steps$|걸음/) : -1,
+    hrAvg: types.includes('heart') ? col(/(average|avg|mean).*heart.?rate|heart.?rate.*(average|avg|mean)|평균.*심박/) : -1,
+    hrMax: types.includes('heart') ? col(/\bmax(imum)?\b.*heart.?rate|heart.?rate.*\bmax(imum)?\b|최대.*심박|최고.*심박/) : -1,
+    hrMin: types.includes('heart') ? col(/\bmin(imum)?\b.*heart.?rate|heart.?rate.*\bmin(imum)?\b|최소.*심박|최저.*심박/) : -1,
+    sleep: types.includes('sleep') ? col(/^sleep duration|total.*sleep|sleep.*(duration|minutes|time)|^수면 ?시간|총 ?수면/) : -1,
+  };
+  if (Object.values(cols).every(i => i < 0)) throw new Error('no-columns');
+  const sleepHead = cols.sleep >= 0 ? head[cols.sleep] : '';
+  const sleepToMin = v => (/\(ms\)|밀리초/.test(sleepHead) ? v / 60000 : /hour|시간\)/.test(sleepHead) ? v * 60 : /sec|초\)/.test(sleepHead) ? v / 60 : v);
+  const num = v => { const n = parseFloat(String(v ?? '').replace(/,/g, '')); return Number.isFinite(n) ? n : null; };
+
+  const days = {};
+  let kept = 0;
+  for (const r of table.slice(hi + 1)) {
+    const day = csvDayKey(r[cDate] ?? '');
+    if (!day || day < fromKey || day >= toKeyExcl) continue;
+    const d = (days[day] ??= { id: day, date: day });
+    const take = (key, v, pick) => { if (v != null) d[key] = d[key] == null ? v : pick(d[key], v); };
+    if (cols.steps >= 0) take('steps', num(r[cols.steps]) == null ? null : Math.round(num(r[cols.steps])), Math.max);
+    if (cols.hrAvg >= 0) take('hrAvg', num(r[cols.hrAvg]) == null ? null : Math.round(num(r[cols.hrAvg])), (a, b) => b);
+    if (cols.hrMax >= 0) take('hrMax', num(r[cols.hrMax]) == null ? null : Math.round(num(r[cols.hrMax])), Math.max);
+    if (cols.hrMin >= 0) take('hrMin', num(r[cols.hrMin]) == null ? null : Math.round(num(r[cols.hrMin])), Math.min);
+    if (cols.sleep >= 0) take('sleepMin', num(r[cols.sleep]) == null ? null : Math.round(sleepToMin(num(r[cols.sleep]))), Math.max);
+    kept++;
+  }
+  onProgress?.(1);
+  const rows = Object.values(days).filter(d => Object.keys(d).length > 2).sort((a, b) => a.date.localeCompare(b.date));
+  return { rows, kept };
+}

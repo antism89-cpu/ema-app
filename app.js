@@ -1,5 +1,5 @@
 import * as DB from './db.js';
-import { HEALTH_TYPES, parseHealthXML, parseChatExport } from './importers.js';
+import { HEALTH_TYPES, parseHealthXML, parseHealthCSV, parseChatExport } from './importers.js';
 
 /* ---------- helpers ---------- */
 const $ = (s, el = document) => el.querySelector(s);
@@ -101,6 +101,14 @@ async function answeredSet() {
   const rs = await DB.all('responses');
   return new Set(rs.map(r => r.promptId).filter(Boolean));
 }
+
+// What is kept from imported AI chats. Older studies stored a boolean (chatIncludeContent).
+const CHAT_MODES = {
+  none: '시각·발화자·글자 수만 (본문·제목 제외)',
+  user: '내가 보낸 메시지의 본문 + 모든 메시지의 시각·글자 수 (AI 답변 본문·제목 제외)',
+  all: '모든 본문·제목·시각·글자 수',
+};
+function chatMode(s = study) { return s.chatContent || (s.chatIncludeContent ? 'all' : 'none'); }
 
 async function saveStudy() { await DB.put('meta', study, 'study'); }
 
@@ -217,13 +225,15 @@ function renderSetup() {
       <h2><span class="num">1</span>기록할 항목</h2>
       <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모. 권한 필요 없음 (필수)</small></div></label>
       <label class="opt"><input type="checkbox" name="prompts" checked><div><b>랜덤 알림 프롬프트</b><small>하루 몇 번 무작위 시간에 응답을 요청합니다. <em>알림 권한</em>을 이 항목을 켰을 때만 요청합니다.</small></div></label>
-      <label class="opt"><input type="checkbox" name="health"><div><b>건강 데이터</b><small>iPhone 건강 앱의 '내보내기' 파일에서 연구 기간 안의 <em>일별 요약</em>만 추출합니다. 원본 파일은 저장하지 않습니다.</small></div></label>
+      <label class="opt"><input type="checkbox" name="health"><div><b>건강 데이터</b><small>iPhone 건강 앱 또는 Android(Google Fit · 삼성 헬스)의 '내보내기' 파일에서 연구 기간 안의 <em>일별 요약</em>만 추출합니다. 원본 파일은 저장하지 않습니다.</small></div></label>
       <div class="sub" data-when="health">
         ${Object.entries(HEALTH_TYPES).map(([k, t]) => `<label class="chk"><input type="checkbox" name="ht_${k}" ${k !== 'heart' ? 'checked' : ''}> ${t.label}</label>`).join('')}
       </div>
       <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 <em>내가 고른 대화</em>의 기간 내 메시지만 남깁니다.</small></div></label>
       <div class="sub" data-when="chat">
-        <label class="opt"><input type="checkbox" name="chatContent"><div><b>메시지 본문과 대화 제목도 저장</b><small>끄면 시각 · 발화자(나/AI) · 글자 수만 저장합니다 (권장).</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>본문 저장 안 함</b><small>시각 · 발화자(나/AI) · 글자 수만 저장합니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="user"><div><b>내가 보낸 메시지 본문만 저장</b><small>AI의 답변은 본문 없이 시각 · 글자 수만 저장합니다. 대화 제목은 저장하지 않습니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="all"><div><b>모든 본문과 대화 제목 저장</b><small>내 메시지와 AI 답변의 본문, 대화 제목까지 저장합니다.</small></div></label>
       </div>
     </section>
 
@@ -255,7 +265,7 @@ function renderSetup() {
     const v = n => f.elements[n];
     return {
       prompts: v('prompts').checked, health: v('health').checked, chat: v('chat').checked,
-      chatContent: v('chatContent').checked,
+      chatContent: v('chatContent').value,
       healthTypes: Object.keys(HEALTH_TYPES).filter(k => v('ht_' + k).checked),
       startDate: v('startDate').value, days: parseInt(v('days').value, 10),
       pid: v('pid').value.trim().replace(/[^\p{L}\p{N}_-]/gu, ''),
@@ -284,7 +294,7 @@ function renderSetup() {
     const perms = [];
     if (o.prompts) { collect.push(`무작위 프롬프트 일정 (하루 ${o.n || '?'}회, ${o.ws}–${o.we})`); perms.push('알림 (프롬프트 시각을 알리기 위해)'); }
     if (o.health) collect.push(`건강 일별 요약: ${o.healthTypes.map(k => HEALTH_TYPES[k].label).join(', ') || '없음'} — 직접 고른 내보내기 파일에서 1회 추출`);
-    if (o.chat) collect.push(`고른 AI 대화의 메시지 ${o.chatContent ? '본문·제목·시각·글자 수' : '시각·발화자·글자 수 (본문 제외)'} — 직접 고른 내보내기 파일에서 1회 추출`);
+    if (o.chat) collect.push(`고른 AI 대화의 메시지 ${CHAT_MODES[o.chatContent]} — 직접 고른 내보내기 파일에서 1회 추출`);
     $('#summary').innerHTML = `
       <dl>
         <dt>기간</dt><dd>${o.startDate ? `${esc(fmtDay(o.startDate))} – ${esc(fmtDay(end))} (${o.days}일). 이 기간 밖의 데이터는 기록하거나 가져오지 않습니다.` : '—'}</dd>
@@ -317,7 +327,7 @@ function renderSetup() {
       startDate: o.startDate, days: o.days,
       window: { start: o.ws, end: o.we }, promptsPerDay: o.n, minGapMin: o.gap, expiryMin: o.expiry,
       modules: { survey: true, prompts: o.prompts, health: o.health, chat: o.chat },
-      healthTypes: o.health ? o.healthTypes : [], chatIncludeContent: o.chat && o.chatContent,
+      healthTypes: o.health ? o.healthTypes : [], chatContent: o.chat ? o.chatContent : 'none',
       exportedAt: null, autoDelete: true,
     };
     await saveStudy();
@@ -450,13 +460,20 @@ async function viewData() {
           <ol class="steps"><li>건강 앱 → 오른쪽 위 프로필 → <b>모든 건강 데이터 내보내기</b></li>
           <li>만들어진 <code>내보내기.zip</code>을 파일 앱에 저장하고 탭해서 압축 해제</li>
           <li>아래에서 폴더 안의 <code>export.xml</code>(또는 <code>내보내기.xml</code>)을 고르세요</li></ol>
+        </details>
+        <details><summary>Android에서 파일 만드는 법</summary>
+          <ul class="steps"><li><b>Google Fit</b>: <code>takeout.google.com</code>에서 'Fit'만 선택해 내보내기 → 받은 zip을 풀고 <b>일일 활동 측정항목</b>(Daily activity metrics) 폴더의 <code>.csv</code> 파일을 고르세요</li>
+          <li><b>삼성 헬스</b>: 설정 → 개인 데이터 다운로드 → 받은 폴더에서 이름에 <code>pedometer_day_summary</code>가 들어간 <code>.csv</code> (걸음 수)</li>
+          <li>그 밖의 앱: 날짜 열과 걸음 · 심박 · 수면 열이 있는 일별 CSV면 읽을 수 있습니다. 안 되면 아래 '직접 입력'을 쓰세요.</li></ul>
+        </details>
+        <details><summary>파일은 어떻게 처리되나요</summary>
           <p class="hint">파일 전체를 읽지만 기간 밖 기록과 고르지 않은 항목은 즉시 버리고, 하루 단위 요약만 저장합니다. 건강 앱과의 지속 연결은 없습니다.</p>
         </details>
         ${locked ? '<p class="chip">연구 시작 후 가져올 수 있습니다</p>' : `
-        <label class="file">export.xml 선택<input type="file" accept=".xml,text/xml,application/xml" data-act="health-file"></label>
+        <label class="file">건강 내보내기 파일 선택 (.xml · .csv)<input type="file" accept=".xml,.csv,text/xml,application/xml,text/csv" data-act="health-file"></label>
         <progress id="healthProg" max="1" value="0" hidden></progress>`}
         ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>날짜</th>${t.includes('steps') ? '<th>걸음</th>' : ''}${t.includes('sleep') ? '<th>수면</th>' : ''}${t.includes('heart') ? '<th>심박 평균 (최저–최고)</th>' : ''}<th></th></tr></thead><tbody>
-          ${rows.map(r => `<tr><td>${fmtDay(r.date)}</td>${t.includes('steps') ? `<td>${r.steps?.toLocaleString() ?? '—'}</td>` : ''}${t.includes('sleep') ? `<td>${r.sleepMin != null ? `${Math.floor(r.sleepMin / 60)}h ${r.sleepMin % 60}m` : '—'}</td>` : ''}${t.includes('heart') ? `<td>${r.hrAvg != null ? `${r.hrAvg} (${r.hrMin}–${r.hrMax})` : '—'}</td>` : ''}<td class="src">${r.manual ? '직접' : ''}</td></tr>`).join('')}
+          ${rows.map(r => `<tr><td>${fmtDay(r.date)}</td>${t.includes('steps') ? `<td>${r.steps?.toLocaleString() ?? '—'}</td>` : ''}${t.includes('sleep') ? `<td>${r.sleepMin != null ? `${Math.floor(r.sleepMin / 60)}h ${r.sleepMin % 60}m` : '—'}</td>` : ''}${t.includes('heart') ? `<td>${r.hrAvg != null ? `${r.hrAvg}${r.hrMin != null && r.hrMax != null ? ` (${r.hrMin}–${r.hrMax})` : ''}` : '—'}</td>` : ''}<td class="src">${r.manual ? '직접' : ''}</td></tr>`).join('')}
           </tbody></table></div>` : '<p class="muted">아직 가져온 건강 데이터가 없습니다.</p>'}
         ${locked ? '' : `<details><summary>파일 없이 직접 입력</summary>
           <form id="manualHealth" class="grid">
@@ -481,7 +498,7 @@ async function viewData() {
     blocks.push(`
       <section class="card">
         <h2>AI 채팅 사용기록</h2>
-        <p class="muted">가져오는 범위: <b>${range}</b> · 저장 내용: <b>${study.chatIncludeContent ? '본문·제목 포함' : '시각·발화자·글자 수만 (본문·제목 제외)'}</b></p>
+        <p class="muted">가져오는 범위: <b>${range}</b> · 저장 내용: <b>${CHAT_MODES[chatMode()]}</b></p>
         <details><summary>내보내기 파일 받는 법</summary>
           <ul class="steps"><li><b>ChatGPT</b>: 설정 → 데이터 제어 → 데이터 내보내기 → 메일로 받은 zip 안의 <code>conversations.json</code></li>
           <li><b>Claude</b>: 설정 → 개인정보 → 데이터 내보내기 → 받은 zip 안의 <code>conversations.json</code></li></ul>
@@ -510,26 +527,27 @@ async function handleChatFile(file) {
     <form id="chatForm" class="pick">
       <p><b>저장할 대화를 고르세요</b> <span class="muted">(기간 안 대화 ${inWin.length}개 / 전체 ${convs.length}개)</span></p>
       <ul>${inWin.map((c, i) => `<li><label><input type="checkbox" name="c" value="${i}"><div><b>${esc(c.title)}</b><small>${c.source === 'claude' ? 'Claude' : 'ChatGPT'} · 기간 내 메시지 ${c.messages.length}개 · 마지막 ${fmtDT(c.messages[c.messages.length - 1].ts)}</small></div></label></li>`).join('')}</ul>
-      <p class="hint">제목은 고르는 데만 보여 주며, ${study.chatIncludeContent ? '본문 저장이 켜져 있어 제목과 본문을 함께 저장합니다.' : '저장하지 않습니다 ("대화 1"처럼 번호로 저장).'}</p>
+      <p class="hint">제목은 고르는 데만 보여 주며, ${chatMode() === 'all' ? '모든 본문 저장이 켜져 있어 제목도 함께 저장합니다.' : '저장하지 않습니다 ("대화 1"처럼 번호로 저장).'}</p>
       <div class="row"><button class="btn primary" type="submit">선택한 대화 저장</button><button class="btn ghost" type="button" data-act="chat-cancel">취소</button></div>
     </form>`;
   $('#chatForm').addEventListener('submit', async e => {
     e.preventDefault();
     const picked = $$('input[name=c]:checked', e.target).map(x => pendingChat[+x.value]);
     if (!picked.length) { toast('대화를 하나 이상 고르세요.'); return; }
+    const mode = chatMode();
     const existing = await DB.all('chat');
     const labels = new Map(existing.map(x => [x.convKey, x.convLabel]));
     let n = new Set(existing.map(x => x.convKey)).size;
     const rows = [];
     for (const c of picked) {
       const key = `${c.source}:${c.id}`;
-      if (!labels.has(key)) labels.set(key, study.chatIncludeContent ? c.title : `대화 ${++n}`);
+      if (!labels.has(key)) labels.set(key, mode === 'all' ? c.title : `대화 ${++n}`);
       for (const m of c.messages) {
         const row = {
           id: `${key}:${m.ts}:${m.role}`, source: c.source, convKey: key, convLabel: labels.get(key),
           ts: m.ts, role: m.role, chars: m.text.length, words: m.text.trim().split(/\s+/).filter(Boolean).length,
         };
-        if (study.chatIncludeContent) row.text = m.text;
+        if (mode === 'all' || (mode === 'user' && m.role === 'user')) row.text = m.text;
         rows.push(row);
       }
     }
@@ -603,7 +621,7 @@ async function exportData(kind) {
   const csvFiles = [{ name: `${base}responses-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(respRows), cols(['id', 'ts', 'promptId', 'promptAt', 'latencySec', 'mood', 'stress', 'fatigue', 'activity', 'social', 'note'])) }];
   if (study.modules.prompts) csvFiles.push({ name: `${base}prompts-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(promptRows), cols(['id', 'date', 'at', 'status'])) });
   if (study.modules.health) csvFiles.push({ name: `${base}health-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(health), cols(['date', 'steps', 'sleepMin', 'hrAvg', 'hrMin', 'hrMax', 'manual'])) });
-  if (study.modules.chat) csvFiles.push({ name: `${base}chat-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(chatRows), cols(['ts', 'source', 'convLabel', 'role', 'chars', 'words', ...(study.chatIncludeContent ? ['text'] : [])])) });
+  if (study.modules.chat) csvFiles.push({ name: `${base}chat-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(chatRows), cols(['ts', 'source', 'convLabel', 'role', 'chars', 'words', ...(chatMode() !== 'none' ? ['text'] : [])])) });
 
   let msg = '내보내기 파일을 만들었습니다.';
   if (kind === 'share') {
@@ -673,12 +691,15 @@ function bindView(v) {
       const prog = $('#healthProg'); prog.hidden = false;
       const { startKey, endKeyExcl } = bounds();
       try {
-        const { rows } = await parseHealthXML(input.files[0], { fromKey: startKey, toKeyExcl: endKeyExcl, types: study.healthTypes, onProgress: p => { prog.value = p; } });
+        const file = input.files[0];
+        const opts = { fromKey: startKey, toKeyExcl: endKeyExcl, types: study.healthTypes, onProgress: p => { prog.value = p; } };
+        const { rows } = /\.csv$/i.test(file.name) || file.type === 'text/csv' ? await parseHealthCSV(file, opts) : await parseHealthXML(file, opts);
         const old = new Map((await DB.all('health')).map(r => [r.id, r]));
         await DB.putMany('health', rows.map(r => ({ ...(old.get(r.id) || {}), ...r, manual: false })));
         toast(rows.length ? `${rows.length}일치 요약을 저장했습니다.` : '연구 기간 안의 해당 기록이 파일에 없습니다.');
       } catch (err) {
-        toast('파일을 읽지 못했습니다. 건강 앱의 export.xml인지 확인하세요.');
+        toast(err.message === 'no-columns' ? '이 CSV에서 날짜 열이나 걸음·심박·수면 열을 찾지 못했습니다. 직접 입력을 써 주세요.'
+          : '파일을 읽지 못했습니다. 건강 앱의 내보내기 파일(.xml 또는 .csv)인지 확인하세요.');
       }
       render();
     } else if (input.dataset?.act === 'chat-file' && input.files[0]) {

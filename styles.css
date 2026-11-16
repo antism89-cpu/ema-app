@@ -73,7 +73,7 @@ main { max-width: 640px; margin: 0 auto; padding: 16px; display: grid; gap: 14px
 .opt + .opt, .sub + .opt { border-top: 1px solid var(--line); }
 .opt input, .chk input, .pick input { width: 20px; height: 20px; margin-top: 2px; flex: none; accent-color: var(--accent); }
 .sub { margin: 0 0 8px 32px; padding: 4px 12px; border-left: 2px solid var(--accent-soft); display: flex; flex-wrap: wrap; gap: 4px 16px; }
-.sub .opt { border: 0; }
+.sub .opt { border: 0; flex: 1 1 100%; padding: 6px 0; }
 .chk { display: inline-flex; gap: 8px; align-items: center; padding: 6px 0; }
 .chk input { margin: 0; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; align-items: end; }

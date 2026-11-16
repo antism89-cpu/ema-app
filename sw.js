@@ -1,6 +1,6 @@
 // App-shell cache so the app opens offline. No data is ever sent anywhere.
-const CACHE = 'ema-shell-v1';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'importers.js', 'icon.svg', 'manifest.webmanifest'];
+const CACHE = 'ema-shell-v2';
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'importers.js', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-180.png', 'manifest.webmanifest'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -17,7 +17,8 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
   e.respondWith(
-    fetch(req).then(res => {
+    // 'no-cache' revalidates with the server so an update never mixes old and new files.
+    fetch(req, { cache: 'no-cache' }).then(res => {
       const copy = res.clone();
       caches.open(CACHE).then(c => c.put(req, copy));
       return res;
