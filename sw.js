@@ -1,5 +1,5 @@
 // App-shell cache so the app opens offline. No data is ever sent anywhere.
-const CACHE = 'ema-shell-v2';
+const CACHE = 'ema-shell-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'importers.js', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-180.png', 'manifest.webmanifest'];
 
 self.addEventListener('install', e => {

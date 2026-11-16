@@ -182,14 +182,15 @@ function currentView() {
 
 function renderTop() {
   const ph = phase();
-  const label = { none: '설정 전', pending: '시작 전', active: '기록 중', ended: '종료됨' }[ph];
+  const h = location.hash.slice(1);
+  const label = { none: h === 'r' ? '연구자용' : h.startsWith('j=') ? '참여 안내' : '시작 전', pending: '시작 전', active: '기록 중', ended: '종료됨' }[ph];
   let sub = '';
   if (study) {
     const { end } = bounds();
     sub = `${fmtDay(study.startDate)} – ${fmtDay(dayKey(addDays(end, -1)))} · ${study.days}일`;
   }
   $('#top').innerHTML = `
-    <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><div><b>EMA 기록</b><small>${esc(sub || '로컬 전용 · 기간 한정')}</small></div></div>
+    <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><div><b>${esc(study?.name || 'EMA 기록')}</b><small>${esc(sub || '로컬 전용 · 기간 한정')}</small></div></div>
     <span class="pill ${ph}">${label}</span>`;
 }
 
@@ -205,136 +206,363 @@ async function render() {
   const seq = ++renderSeq;
   renderTop();
   renderTabs();
-  if (!study) return renderSetup();
+  if (!study) {
+    const h = location.hash.slice(1);
+    $('#app').onclick = null; $('#app').onchange = null;
+    if (h.startsWith('j=')) return renderJoin(h.slice(2));
+    if (h === 'r') return renderResearcher();
+    return renderLanding();
+  }
+  if (location.hash.startsWith('#j=')) {   // a link opened on a device that already has a study: never overwrite it
+    const c = parseConfig(location.hash.slice(3));
+    if (c && (c.sid !== study.studyCode || c.pid !== study.participantId)) toast('이 기기에는 이미 진행 중인 연구가 있어 새 링크를 적용하지 않았습니다.');
+    history.replaceState(null, '', '#home');
+    renderTabs();
+  }
   const html = await ({ home: viewHome, survey: viewSurvey, data: viewData, export: viewExport })[currentView()]();
   if (seq !== renderSeq) return;
   $('#app').innerHTML = html;
   bindView(currentView());
 }
 
-/* ---------- setup ---------- */
-function renderSetup() {
+/* ---------- study config: made by the researcher, carried in a link, fixed for the participant ---------- */
+const b64enc = obj => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj))))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64dec = str => JSON.parse(new TextDecoder().decode(
+  Uint8Array.from(atob(str.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))));
+const cleanCode = s => String(s || '').trim().replace(/[^\p{L}\p{N}_-]/gu, '').slice(0, 24);
+const isTime = s => /^\d{2}:\d{2}$/.test(s);
+const isDay = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+const OPTIONAL_KEYS = ['prompts', 'health', 'chat'];
+
+function validateConfig(o) {
+  if (o.fixed && !isDay(o.start || '')) return '고정 시작일을 정해 주세요.';
+  if (!(o.days >= 1 && o.days <= 90)) return '기간은 1–90일 사이로 정해 주세요.';
+  if (o.health && !o.healthTypes.length) return '건강 데이터 항목을 하나 이상 고르세요.';
+  if (o.prompts) {
+    if (!isTime(o.ws) || !isTime(o.we) || toMin(o.we) <= toMin(o.ws)) return '응답 시간대의 끝이 시작보다 늦어야 합니다.';
+    if (!(o.n >= 1 && o.n <= 12)) return '하루 프롬프트 수는 1–12 사이로 정해 주세요.';
+    if (!(o.expiry >= 5)) return '응답 유효 시간은 5분 이상이어야 합니다.';
+    if ((toMin(o.we) - toMin(o.ws)) / o.n <= o.gap) return '시간대가 짧거나 프롬프트가 많아 최소 간격을 지킬 수 없습니다. 간격이나 횟수를 줄이세요.';
+    if (o.gap < o.expiry) return '최소 간격은 응답 유효 시간 이상이어야 합니다.';
+  }
+  return '';
+}
+
+// Decodes and sanitizes a config taken from a link. Returns null if it is not usable.
+function parseConfig(code) {
+  try {
+    const c = b64dec(code);
+    if (!c || c.v !== 1) return null;
+    const o = {
+      v: 1, sid: cleanCode(c.sid), name: String(c.name || '').slice(0, 80), contact: String(c.contact || '').slice(0, 120),
+      start: isDay(c.start || '') ? c.start : '', days: Number(c.days),
+      prompts: !!c.prompts, ws: String(c.ws || '09:00'), we: String(c.we || '21:00'),
+      n: Number(c.n) || 5, gap: Number(c.gap) || 0, expiry: Number(c.expiry) || 30,
+      health: !!c.health, healthTypes: (Array.isArray(c.healthTypes) ? c.healthTypes : []).filter(k => HEALTH_TYPES[k]),
+      chat: !!c.chat, chatContent: CHAT_MODES[c.chatContent] ? c.chatContent : 'none',
+      pid: cleanCode(c.pid),
+    };
+    o.opt = (Array.isArray(c.opt) ? c.opt : []).filter(k => OPTIONAL_KEYS.includes(k) && o[k]);
+    o.fixed = !!o.start;
+    return validateConfig(o) ? null : o;
+  } catch { return null; }
+}
+
+function linkCode(text) {
+  const m = String(text).match(/j=([A-Za-z0-9_-]+)/);
+  return m ? m[1] : String(text).trim();
+}
+
+function configSummary(o, who) {
+  const start = o.start || dayKey(new Date());
+  const end = isDay(start) && o.days ? dayKey(addDays(parseDay(start), o.days - 1)) : '';
+  const period = !o.days ? '—'
+    : o.start ? `${fmtDay(start)} – ${fmtDay(end)} (${o.days}일, 날짜 고정)`
+    : who === 'researcher' ? `참가자가 동의한 날부터 ${o.days}일`
+    : `오늘 ${fmtDay(start)}부터 ${fmtDay(end)}까지 (${o.days}일)`;
+  const tag = k => (who !== 'researcher' ? '' : (o.opt || []).includes(k) ? ' [선택: 참가자가 끌 수 있음]' : ' [필수]');
+  const collect = ['자기보고 설문 응답과 응답 시각 (기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모)' + (who === 'researcher' ? ' [필수]' : '')];
+  const perms = [];
+  if (o.prompts) { collect.push(`무작위 프롬프트 일정 (하루 ${o.n || '?'}회, ${o.ws}–${o.we})` + tag('prompts')); perms.push('알림 (프롬프트 시각을 알리기 위해)'); }
+  if (o.health) collect.push(`건강 일별 요약: ${o.healthTypes.map(k => HEALTH_TYPES[k].label).join(', ') || '없음'} — 직접 고른 내보내기 파일에서 추출` + tag('health'));
+  if (o.chat) collect.push(`고른 AI 대화의 ${CHAT_MODES[o.chatContent]} — 직접 고른 내보내기 파일에서 추출` + tag('chat'));
+  return `
+    <dl>
+      <dt>기간</dt><dd>${esc(period)}. 이 기간 밖의 데이터는 기록하거나 가져오지 않습니다.</dd>
+      <dt>기록 항목</dt><dd><ul>${collect.map(c => `<li>${esc(c)}</li>`).join('')}</ul></dd>
+      <dt>요청 권한</dt><dd>${perms.length ? perms.map(esc).join(', ') : '없음'}</dd>
+      <dt>저장 위치</dt><dd>이 기기의 브라우저 저장소에만. 서버로 전송하지 않습니다.</dd>
+      <dt>전달</dt><dd>자동 전송 없음. 연구가 끝난 뒤 내보내기 화면에서 직접 파일을 보낼 때만 연구자에게 전달됩니다.</dd>
+      <dt>종료 후</dt><dd>기록 · 알림 중단 → 내보내기 → 24시간 뒤 기기 안 데이터 자동 삭제</dd>
+      ${who === 'participant' && o.pid ? `<dt>참가자 코드</dt><dd><b>${esc(o.pid)}</b> (보내는 파일에 표시됩니다)</dd>` : ''}
+    </dl>`;
+}
+
+// Creates the study on this device. Called only from the participant's consent button.
+async function startStudy(o) {
+  let notif = 'not-requested';
+  if (o.prompts && 'Notification' in window) {   // asked only now, only if prompts are part of the study
+    try { notif = await Notification.requestPermission(); } catch { notif = 'unsupported'; }
+  }
+  study = {
+    id: uid(), studyCode: o.sid || '', name: o.name || '', contact: o.contact || '',
+    createdAt: Date.now(), consentAt: Date.now(), participantId: o.pid || '',
+    startMode: o.start ? 'fixed' : 'on-consent', startDate: o.start || dayKey(new Date()), days: o.days,
+    window: { start: o.ws, end: o.we }, promptsPerDay: o.n, minGapMin: o.gap, expiryMin: o.expiry,
+    modules: { survey: true, prompts: o.prompts, health: o.health, chat: o.chat },
+    healthTypes: o.health ? o.healthTypes : [], chatContent: o.chat ? o.chatContent : 'none',
+    optionalItems: o.opt || [], declinedItems: o.declined || [],
+    exportedAt: null, autoDelete: true,
+  };
+  await saveStudy();
+  if (o.prompts) await DB.putMany('prompts', generatePrompts(study));
+  location.hash = 'home';
+  render();
+  toast(o.prompts && notif !== 'granted' ? '시작했습니다. 알림이 꺼져 있어 홈에서 다시 켜거나 캘린더 알림을 쓸 수 있습니다.' : '시작했습니다.');
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = Object.assign(document.createElement('textarea'), { value: text });
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch {}
+  ta.remove();
+  return ok;
+}
+
+/* ---------- landing (no study on this device, no link) ---------- */
+function renderLanding() {
+  $('#app').innerHTML = `
+    <section class="card hero">
+      <h1>EMA 기록</h1>
+      <p>정해진 항목만, 정해진 기간 동안만 기록하는 앱입니다. 기록은 이 기기 안에만 저장됩니다.</p>
+    </section>
+    <section class="card">
+      <h2>참가자</h2>
+      <p class="muted">연구자에게 받은 링크를 열면 안내가 바로 나옵니다. 홈 화면에 설치한 앱에서는 받은 링크를 아래에 붙여넣으세요.</p>
+      <form id="paste">
+        <label class="field">참여 링크<input type="text" name="link" placeholder="받은 링크를 붙여넣으세요" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <button class="btn primary block" type="submit">연구 안내 보기</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>연구자</h2>
+      <p class="muted">기록 항목과 기간을 정하고 참가자별 참여 링크를 만듭니다.</p>
+      <a class="btn block" href="#r">연구 설정 만들기</a>
+    </section>`;
+  $('#paste').addEventListener('submit', e => {
+    e.preventDefault();
+    const code = linkCode(e.target.elements.link.value);
+    if (!code || !parseConfig(code)) return toast('참여 링크가 올바르지 않습니다. 받은 링크 전체를 붙여넣어 주세요.');
+    location.hash = 'j=' + code;
+  });
+}
+
+/* ---------- participant: fixed summary, consent only ---------- */
+function renderJoin(code) {
+  const o = parseConfig(code);
+  const app = $('#app');
+  if (!o) {
+    app.innerHTML = `<section class="card"><h2>참여 링크가 올바르지 않습니다</h2><p class="muted">링크가 잘렸을 수 있습니다. 연구자에게 받은 링크 전체를 다시 열거나 붙여넣어 주세요.</p><a class="btn block" href="#">처음으로</a></section>`;
+    return;
+  }
+  if (o.start && new Date() >= addDays(parseDay(o.start), o.days)) {
+    app.innerHTML = `<section class="card"><h2>이 연구의 기간이 끝났습니다</h2><p class="muted">${esc(fmtDay(o.start))}부터 ${o.days}일 동안 진행된 연구입니다. 아무것도 기록하지 않습니다.</p></section>`;
+    return;
+  }
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const android = /Android/.test(navigator.userAgent);
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  const link = location.origin + location.pathname + '#j=' + code;
+  const install = standalone ? '' : ios ? `
+    <section class="card notice">
+      <h2>iPhone은 먼저 홈 화면에 추가하세요</h2>
+      <ol class="steps"><li>아래 <b>참여 링크 복사</b>를 누릅니다</li><li>Safari의 공유 버튼 → <b>홈 화면에 추가</b></li><li>홈 화면의 <b>EMA</b> 앱을 열고 복사한 링크를 붙여넣습니다</li></ol>
+      <p class="hint">Safari에서 바로 시작하면 홈 화면 앱과 기록이 따로 저장되고, 알림이 오지 않으며, 오래 열지 않으면 기록이 지워질 수 있습니다.</p>
+      <button class="btn block" type="button" data-act="copy-link">참여 링크 복사</button>
+    </section>` : android ? `
+    <section class="card notice"><p>시작한 뒤 Chrome 메뉴 → <b>앱 설치</b>(홈 화면에 추가)를 해 두면 알림을 받고 앱처럼 열 수 있습니다.</p></section>` : '';
+  app.innerHTML = `
+    <section class="card hero">
+      <h1>${esc(o.name || 'EMA 연구 참여 안내')}</h1>
+      <p>연구자가 정한 아래 내용대로만 기록합니다. 내용을 확인하고 동의하면 시작됩니다.</p>
+      ${o.contact ? `<p><b>연구자 · 문의</b> ${esc(o.contact)}</p>` : ''}
+    </section>
+    ${install}
+    <form id="join" class="card">
+      <h2>기록 항목</h2>
+      <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b> <span class="chip">필수</span><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모</small></div></label>
+      ${OPTIONAL_KEYS.filter(k => o[k]).map(k => {
+        const optional = o.opt.includes(k);
+        const info = {
+          prompts: ['랜덤 알림 프롬프트', `하루 ${o.n}회, ${o.ws}–${o.we} 사이 무작위 시각에 응답 요청. 알림 권한을 요청합니다.`],
+          health: ['건강 데이터', `${o.healthTypes.map(t => HEALTH_TYPES[t].label).join(', ')}의 일별 요약. 직접 고른 내보내기 파일에서만 추출합니다.`],
+          chat: ['AI 채팅 사용기록', `직접 고른 대화의 ${CHAT_MODES[o.chatContent]}.`],
+        }[k];
+        return `<label class="opt"><input type="checkbox" name="m_${k}" checked ${optional ? '' : 'disabled'}><div><b>${info[0]}</b> <span class="chip ${optional ? 'ok' : ''}">${optional ? '선택' : '필수'}</span><small>${esc(info[1])}${optional ? ' 원하지 않으면 체크를 해제하세요.' : ''}</small></div></label>`;
+      }).join('')}
+      <h2 style="margin-top:16px">기록 내용 요약</h2>
+      <div class="summary" id="joinSummary"></div>
+      <label class="opt"><input type="checkbox" name="consent"><div><b>위 내용을 확인했고 참여에 동의합니다</b></div></label>
+      <button class="btn primary block" type="submit">동의하고 시작</button>
+      <p class="hint">참여하지 않으려면 이 페이지를 닫으세요. 동의하기 전에는 아무것도 저장하거나 권한을 요청하지 않습니다. 시작한 뒤에도 내보내기 화면에서 언제든 모든 기록을 삭제하고 그만둘 수 있습니다.</p>
+    </form>`;
+  app.onclick = async e => {
+    if (e.target.closest('[data-act=copy-link]')) toast((await copyText(link)) ? '링크를 복사했습니다.' : '복사하지 못했습니다. 주소창의 링크를 직접 복사해 주세요.');
+  };
+  app.onchange = null;
+  const jf = $('#join');
+  // Required items stay on; only items the researcher marked optional can be turned off.
+  const chosen = () => {
+    const declined = o.opt.filter(k => !jf.elements['m_' + k].checked);
+    const c = { ...o, declined };
+    for (const k of declined) c[k] = false;
+    return c;
+  };
+  const showSummary = () => { $('#joinSummary').innerHTML = configSummary(chosen(), 'participant'); };
+  jf.addEventListener('change', showSummary);
+  showSummary();
+  jf.addEventListener('submit', e => {
+    e.preventDefault();
+    if (!jf.elements.consent.checked) return toast('동의에 체크해 주세요.');
+    startStudy(chosen());
+  });
+}
+
+/* ---------- researcher: choose settings, make one link per participant ---------- */
+function renderResearcher() {
   const today = dayKey(new Date());
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('ema-researcher') || '{}'); } catch {}
   $('#app').innerHTML = `
   <section class="card hero">
-    <h1>새 EMA 연구 설정</h1>
-    <p>고른 항목만, 정해진 기간 동안만 기록합니다. 다른 앱과의 연동은 계속 연결해 두는 방식이 아니라 <b>내가 고른 파일을 한 번 읽어 기간 안의 데이터만 남기는</b> 방식입니다. 모든 데이터는 이 기기 안에만 저장됩니다.</p>
+    <h1>연구자용 · 연구 설정</h1>
+    <p>여기서 정한 내용이 참가자 링크에 담깁니다. 필수 항목은 참가자가 끌 수 없고, '선택 항목'으로 표시한 것만 참가자가 끌 수 있습니다. 이 페이지 자체는 아무것도 기록하지 않습니다.</p>
   </section>
   <form id="setup" novalidate>
     <section class="card">
       <h2><span class="num">1</span>기록할 항목</h2>
       <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모. 권한 필요 없음 (필수)</small></div></label>
-      <label class="opt"><input type="checkbox" name="prompts" checked><div><b>랜덤 알림 프롬프트</b><small>하루 몇 번 무작위 시간에 응답을 요청합니다. <em>알림 권한</em>을 이 항목을 켰을 때만 요청합니다.</small></div></label>
-      <label class="opt"><input type="checkbox" name="health"><div><b>건강 데이터</b><small>iPhone 건강 앱 또는 Android(Google Fit · 삼성 헬스)의 '내보내기' 파일에서 연구 기간 안의 <em>일별 요약</em>만 추출합니다. 원본 파일은 저장하지 않습니다.</small></div></label>
+      <label class="opt"><input type="checkbox" name="prompts" checked><div><b>랜덤 알림 프롬프트</b><small>하루 몇 번 무작위 시간에 응답을 요청합니다. 참가자에게 <em>알림 권한</em>을 요청합니다.</small></div></label>
+      <div class="sub" data-when="prompts"><label class="chk"><input type="checkbox" name="opt_prompts"> 선택 항목으로 (참가자가 끌 수 있음)</label></div>
+      <label class="opt"><input type="checkbox" name="health"><div><b>건강 데이터</b><small>iPhone 건강 앱 또는 Android(Google Fit · 삼성 헬스)의 '내보내기' 파일에서 연구 기간 안의 <em>일별 요약</em>만 추출합니다.</small></div></label>
       <div class="sub" data-when="health">
         ${Object.entries(HEALTH_TYPES).map(([k, t]) => `<label class="chk"><input type="checkbox" name="ht_${k}" ${k !== 'heart' ? 'checked' : ''}> ${t.label}</label>`).join('')}
+        <label class="chk full"><input type="checkbox" name="opt_health"> 선택 항목으로 (참가자가 끌 수 있음)</label>
       </div>
-      <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 <em>내가 고른 대화</em>의 기간 내 메시지만 남깁니다.</small></div></label>
+      <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 <em>참가자가 고른 대화</em>의 기간 내 메시지만 남깁니다.</small></div></label>
       <div class="sub" data-when="chat">
-        <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>시각 · 글자 수만 저장 (본문 제외)</b><small>메시지마다 보낸 시각, 발화자(나/AI), 글자 수를 저장합니다. 본문과 대화 제목은 저장하지 않습니다.</small></div></label>
-        <label class="opt"><input type="radio" name="chatContent" value="user"><div><b>내가 보낸 메시지 본문만 저장</b><small>AI의 답변은 본문 없이 시각 · 글자 수만 저장합니다. 대화 제목은 저장하지 않습니다.</small></div></label>
-        <label class="opt"><input type="radio" name="chatContent" value="all"><div><b>모든 본문과 대화 제목 저장</b><small>내 메시지와 AI 답변의 본문, 대화 제목까지 저장합니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>시각 · 글자 수만 저장 (본문 제외)</b><small>메시지마다 보낸 시각, 발화자(나/AI), 글자 수를 저장합니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="user"><div><b>참가자가 보낸 메시지 본문만 저장</b><small>AI의 답변은 본문 없이 시각 · 글자 수만 저장합니다. 대화 제목은 저장하지 않습니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="all"><div><b>모든 본문과 대화 제목 저장</b><small>참가자 메시지와 AI 답변의 본문, 대화 제목까지 저장합니다.</small></div></label>
+        <label class="chk full"><input type="checkbox" name="opt_chat"> 선택 항목으로 (참가자가 끌 수 있음)</label>
       </div>
     </section>
 
     <section class="card">
       <h2><span class="num">2</span>기간과 일정</h2>
-      <div class="grid">
-        <label>시작일<input type="date" name="startDate" value="${today}" min="${today}"></label>
+      <label class="opt"><input type="radio" name="startMode" value="consent" checked><div><b>참가자가 동의한 날부터</b><small>참가자마다 시작일이 달라도 됩니다 (기본).</small></div></label>
+      <label class="opt"><input type="radio" name="startMode" value="fixed"><div><b>시작일 고정</b><small>모든 참가자가 같은 날짜에 시작하고 끝납니다.</small></div></label>
+      <div class="grid" style="margin-top:12px">
+        <label data-when="fixed">시작일<input type="date" name="startDate" value="${today}" min="${today}"></label>
         <label>기간 (일)<input type="number" name="days" value="14" min="1" max="90" inputmode="numeric"></label>
-        <label>참가자 코드 (선택)<input type="text" name="pid" maxlength="24" placeholder="예: P01" autocomplete="off" autocapitalize="characters"></label>
         <label data-when="prompts">응답 시간대 시작<input type="time" name="ws" value="09:00"></label>
         <label data-when="prompts">응답 시간대 끝<input type="time" name="we" value="21:00"></label>
         <label data-when="prompts">하루 프롬프트 수<input type="number" name="n" value="5" min="1" max="12" inputmode="numeric"></label>
         <label data-when="prompts">최소 간격 (분)<input type="number" name="gap" value="60" min="0" max="240" inputmode="numeric"></label>
         <label data-when="prompts">응답 유효 시간 (분)<input type="number" name="expiry" value="30" min="5" max="120" inputmode="numeric"></label>
       </div>
-      <p class="err" id="setupErr" hidden></p>
     </section>
 
     <section class="card">
-      <h2><span class="num">3</span>확인과 동의</h2>
+      <h2><span class="num">3</span>연구 정보 (참가자에게 표시)</h2>
+      <div class="grid">
+        <label>연구 이름 (선택)<input type="text" name="name" maxlength="80" placeholder="예: AI 사용과 일상 기분 연구"></label>
+        <label>연구자 · 문의처 (선택)<input type="text" name="contact" maxlength="120" placeholder="예: 홍길동, 연구실 메일"></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span class="num">4</span>참가자 링크 만들기</h2>
+      <p class="muted">참가자에게 보이는 내용</p>
       <div id="summary" class="summary"></div>
-      <label class="opt"><input type="checkbox" name="consent"><div><b>위 내용을 확인했고 동의합니다</b></div></label>
-      <button class="btn primary block" type="submit">연구 시작</button>
+      <label class="field">참가자 코드 (쉼표나 줄바꿈으로 구분, 코드마다 링크 1개)
+        <textarea name="codes" rows="3" placeholder="P01, P02, P03" autocapitalize="characters" spellcheck="false"></textarea></label>
+      <p class="err" id="setupErr" hidden></p>
+      <button class="btn primary block" type="submit">참가자 링크 만들기</button>
+      <div id="links"></div>
     </section>
   </form>`;
 
   const f = $('#setup');
-  const read = () => {
-    const v = n => f.elements[n];
-    return {
-      prompts: v('prompts').checked, health: v('health').checked, chat: v('chat').checked,
-      chatContent: v('chatContent').value,
-      healthTypes: Object.keys(HEALTH_TYPES).filter(k => v('ht_' + k).checked),
-      startDate: v('startDate').value, days: parseInt(v('days').value, 10),
-      pid: v('pid').value.trim().replace(/[^\p{L}\p{N}_-]/gu, ''),
-      ws: v('ws').value, we: v('we').value, n: parseInt(v('n').value, 10),
-      gap: parseInt(v('gap').value, 10), expiry: parseInt(v('expiry').value, 10),
-    };
-  };
-  const validate = o => {
-    if (!o.startDate) return '시작일을 정해 주세요.';
-    if (!(o.days >= 1 && o.days <= 90)) return '기간은 1–90일 사이로 정해 주세요.';
-    if (o.health && !o.healthTypes.length) return '건강 데이터 항목을 하나 이상 고르세요.';
-    if (o.prompts) {
-      if (!o.ws || !o.we || toMin(o.we) <= toMin(o.ws)) return '응답 시간대의 끝이 시작보다 늦어야 합니다.';
-      if (!(o.n >= 1 && o.n <= 12)) return '하루 프롬프트 수는 1–12 사이로 정해 주세요.';
-      if (!(o.expiry >= 5)) return '응답 유효 시간은 5분 이상이어야 합니다.';
-      if ((toMin(o.we) - toMin(o.ws)) / o.n <= o.gap) return '시간대가 짧거나 프롬프트가 많아 최소 간격을 지킬 수 없습니다. 간격이나 횟수를 줄이세요.';
-      if (o.gap < o.expiry) return '최소 간격은 응답 유효 시간 이상이어야 합니다.';
-    }
-    return '';
-  };
+  const v = n => f.elements[n];
+  // restore the researcher's last settings (kept only in this browser, as a convenience)
+  for (const [k, val] of Object.entries(saved)) {
+    const el = v(k);
+    if (!el) continue;
+    if (el instanceof RadioNodeList) el.value = val;
+    else if (el.type === 'checkbox') el.checked = !!val;
+    else if (k !== 'startDate' || val >= today) el.value = val;
+  }
+  const read = () => ({
+    v: 1, name: v('name').value.trim(), contact: v('contact').value.trim(),
+    fixed: v('startMode').value === 'fixed', start: v('startMode').value === 'fixed' ? v('startDate').value : '',
+    days: parseInt(v('days').value, 10),
+    prompts: v('prompts').checked, ws: v('ws').value, we: v('we').value, n: parseInt(v('n').value, 10),
+    gap: parseInt(v('gap').value, 10), expiry: parseInt(v('expiry').value, 10),
+    health: v('health').checked, healthTypes: Object.keys(HEALTH_TYPES).filter(k => v('ht_' + k).checked),
+    chat: v('chat').checked, chatContent: v('chatContent').value,
+    opt: OPTIONAL_KEYS.filter(k => v(k).checked && v('opt_' + k).checked),
+  });
+  const codes = () => [...new Set(v('codes').value.split(/[,;\n]+/).map(cleanCode).filter(Boolean))];
   const update = () => {
     const o = read();
     $$('[data-when]', f).forEach(el => { el.hidden = !o[el.dataset.when]; });
-    const end = o.startDate && o.days ? dayKey(addDays(parseDay(o.startDate), o.days - 1)) : '';
-    const collect = ['자기보고 설문 응답과 응답 시각'];
-    const perms = [];
-    if (o.prompts) { collect.push(`무작위 프롬프트 일정 (하루 ${o.n || '?'}회, ${o.ws}–${o.we})`); perms.push('알림 (프롬프트 시각을 알리기 위해)'); }
-    if (o.health) collect.push(`건강 일별 요약: ${o.healthTypes.map(k => HEALTH_TYPES[k].label).join(', ') || '없음'} — 직접 고른 내보내기 파일에서 1회 추출`);
-    if (o.chat) collect.push(`고른 AI 대화의 메시지 ${CHAT_MODES[o.chatContent]} — 직접 고른 내보내기 파일에서 1회 추출`);
-    $('#summary').innerHTML = `
-      <dl>
-        <dt>기간</dt><dd>${o.startDate ? `${esc(fmtDay(o.startDate))} – ${esc(fmtDay(end))} (${o.days}일). 이 기간 밖의 데이터는 기록하거나 가져오지 않습니다.` : '—'}</dd>
-        <dt>기록 항목</dt><dd><ul>${collect.map(c => `<li>${esc(c)}</li>`).join('')}</ul></dd>
-        <dt>요청 권한</dt><dd>${perms.length ? perms.map(esc).join(', ') : '없음'}</dd>
-        <dt>저장 위치</dt><dd>이 기기의 브라우저 저장소에만. 서버로 전송하지 않습니다.</dd>
-        <dt>전달</dt><dd>자동 전송 없음. 내보내기 화면에서 내가 직접 파일을 보낼 때만 전달됩니다${o.pid ? ` (파일에 참가자 코드 ${esc(o.pid)} 표시)` : ''}.</dd>
-        <dt>종료 후</dt><dd>기록 · 알림 중단 → 내보내기 → 24시간 뒤 기기 안 데이터 자동 삭제</dd>
-      </dl>`;
-    const err = validate(o);
+    $('#summary').innerHTML = configSummary(o, 'researcher');
+    const err = validateConfig(o);
     const e = $('#setupErr'); e.hidden = !err; e.textContent = err;
+    $('#links').innerHTML = '';   // settings changed: old links no longer match what is shown
   };
   f.addEventListener('input', update);
   f.addEventListener('change', update);
   update();
 
-  f.addEventListener('submit', async e => {
+  f.addEventListener('submit', e => {
     e.preventDefault();
     const o = read();
-    const err = validate(o);
-    if (err) { toast(err); return; }
-    if (!f.elements.consent.checked) { toast('동의에 체크해 주세요.'); return; }
-    // Ask for notification permission only now, only if prompts were chosen (needs the click gesture).
-    let notif = 'not-requested';
-    if (o.prompts && 'Notification' in window) {
-      try { notif = await Notification.requestPermission(); } catch { notif = 'unsupported'; }
-    }
-    study = {
-      id: uid(), createdAt: Date.now(), consentAt: Date.now(), participantId: o.pid || '',
-      startDate: o.startDate, days: o.days,
-      window: { start: o.ws, end: o.we }, promptsPerDay: o.n, minGapMin: o.gap, expiryMin: o.expiry,
-      modules: { survey: true, prompts: o.prompts, health: o.health, chat: o.chat },
-      healthTypes: o.health ? o.healthTypes : [], chatContent: o.chat ? o.chatContent : 'none',
-      exportedAt: null, autoDelete: true,
+    const err = validateConfig(o);
+    if (err) return toast(err);
+    const list = codes();
+    if (!list.length) return toast('참가자 코드를 하나 이상 입력하세요.');
+    const { fixed, ...cfg } = o;
+    if (!cfg.prompts) { delete cfg.ws; delete cfg.we; delete cfg.n; delete cfg.gap; delete cfg.expiry; }
+    cfg.sid = 'S' + hashStr(JSON.stringify(cfg)).toString(36).toUpperCase();   // same settings -> same study code
+    const base = location.origin + location.pathname + '#j=';
+    const rows = list.map(pid => ({ pid, url: base + b64enc({ ...cfg, pid }) }));
+    try {
+      const keep = {};
+      for (const el of f.elements) {
+        if (!el.name || el.disabled) continue;
+        if (el.type === 'radio') { if (el.checked) keep[el.name] = el.value; }
+        else keep[el.name] = el.type === 'checkbox' ? el.checked : el.value;
+      }
+      localStorage.setItem('ema-researcher', JSON.stringify(keep));
+    } catch {}
+    $('#links').innerHTML = `
+      <p class="muted" style="margin-top:16px">연구 코드 <b>${esc(cfg.sid)}</b> · 링크 ${rows.length}개. 각 참가자에게 자기 코드의 링크만 보내세요.</p>
+      <ul class="links">${rows.map((r, i) => `<li><b>${esc(r.pid)}</b><input type="text" readonly value="${esc(r.url)}" aria-label="${esc(r.pid)} 참여 링크" onfocus="this.select()">
+        <button class="btn small" type="button" data-copy="${i}">복사</button><a class="btn small ghost" href="${esc(r.url)}" target="_blank" rel="noopener">미리보기</a></li>`).join('')}</ul>
+      ${rows.length > 1 ? '<button class="btn block" type="button" data-copy="all">전체 복사 (코드와 링크 목록)</button>' : ''}
+      <p class="hint">링크에는 위 설정과 참가자 코드만 들어 있습니다. 설정을 바꾸면 링크를 다시 만들어야 하며, 이미 시작한 참가자에게는 적용되지 않습니다.</p>`;
+    $('#links').onclick = async ev => {
+      const b = ev.target.closest('[data-copy]');
+      if (!b) return;
+      const text = b.dataset.copy === 'all' ? rows.map(r => `${r.pid}\t${r.url}`).join('\n') : rows[+b.dataset.copy].url;
+      toast((await copyText(text)) ? '복사했습니다.' : '복사하지 못했습니다. 링크를 길게 눌러 직접 복사해 주세요.');
     };
-    await saveStudy();
-    if (o.prompts) await DB.putMany('prompts', generatePrompts(study));
-    location.hash = 'home';
-    render();
-    toast(o.prompts && notif !== 'granted' ? '연구를 만들었습니다. 알림이 꺼져 있어 홈에서 다시 켜거나 캘린더 알림을 쓸 수 있습니다.' : '연구를 만들었습니다.');
+    $('#links').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
 }
 
