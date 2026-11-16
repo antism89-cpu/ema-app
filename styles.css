@@ -78,7 +78,7 @@ main { max-width: 640px; margin: 0 auto; padding: 16px; display: grid; gap: 14px
 .chk input { margin: 0; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; align-items: end; }
 .grid label, .field { display: grid; gap: 4px; font-size: .86rem; color: var(--muted); font-weight: 600; }
-input[type=date], input[type=time], input[type=number], input[type=text], textarea {
+input[type=date], input[type=time], input[type=number], input[type=text], input[type=url], textarea {
   width: 100%; min-height: 44px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line);
   background: var(--bg); color: var(--ink); font: inherit;
 }
@@ -173,3 +173,6 @@ td.src { color: var(--muted); font-size: .8rem; }
 .links b { overflow-wrap: anywhere; }
 .links input { min-width: 0; font-size: .8rem; color: var(--muted); }
 @media (max-width: 480px) { .links li { grid-template-columns: 1fr auto auto; } .links input { grid-column: 1 / -1; order: 3; } }
+
+.subhead { flex: 1 1 100%; margin: 8px 0 0; font-size: .8rem; font-weight: 700; color: var(--muted); }
+.sleepq { margin-top: 0; }

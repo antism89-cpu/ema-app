@@ -69,19 +69,30 @@ function hashStr(s) { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt
 
 // Stratified random schedule: the wake window is split into N blocks, one prompt per block,
 // placed so consecutive prompts are always at least minGap minutes apart.
+const MORNING_MIN = 60;
+
 function generatePrompts(s) {
   const out = [];
   const { start } = bounds(s);
   const ws = toMin(s.window.start), we = toMin(s.window.end);
   const n = s.promptsPerDay;
-  const block = (we - ws) / n;
+  // With morningFirst, prompt 0 falls in the first MORNING_MIN minutes of the window and the
+  // remaining n-1 prompts are spread over the rest, each at least minGap after the previous one.
+  const morning = !!s.morningFirst;
+  const restStart = morning ? ws + MORNING_MIN : ws;
+  const restN = morning ? n - 1 : n;
+  const block = restN > 0 ? (we - restStart) / restN : 0;
   const slack = Math.max(0, block - s.minGapMin);
   for (let d = 0; d < s.days; d++) {
     const day = addDays(start, d);
     const key = dayKey(day);
     const rnd = mulberry32(hashStr(s.id + key));
     for (let i = 0; i < n; i++) {
-      const m = Math.round(ws + i * block + rnd() * slack);
+      const j = morning ? i - 1 : i;
+      const m = Math.round(
+        morning && i === 0 ? ws + rnd() * MORNING_MIN
+        : morning ? restStart + j * block + (block - slack) + rnd() * slack
+        : ws + i * block + rnd() * slack);
       const t = new Date(day); t.setHours(0, m, 0, 0);
       // Prompts that fell before the study was created are not scheduled (they would count as missed).
       if (t.getTime() > s.createdAt) out.push({ id: `${key}-${i}`, date: key, idx: i, at: t.getTime() });
@@ -107,6 +118,15 @@ const CHAT_MODES = {
   none: '시각·발화자·글자 수만 (본문·제목 제외)',
   user: '내가 보낸 메시지의 본문 + 모든 메시지의 시각·글자 수 (AI 답변 본문·제목 제외)',
   all: '모든 본문·제목·시각·글자 수',
+};
+const CHAT_PICK = {
+  all: '기간 안 모든 대화',
+  exclude: '기간 안 모든 대화 (참가자가 일부 제외 가능, 제외한 수는 기록)',
+  pick: '참가자가 고른 대화',
+};
+function chatPick(s = study) { return s.chatPick || 'pick'; }   // studies made before this setting let the participant pick
+const httpsUrl = s => {
+  try { const u = new URL(String(s || '').trim().slice(0, 300)); return u.protocol === 'https:' ? u.href : ''; } catch { return ''; }
 };
 function chatMode(s = study) { return s.chatContent || (s.chatIncludeContent ? 'all' : 'none'); }
 
@@ -246,7 +266,11 @@ function validateConfig(o) {
     if (!(o.expiry >= 5)) return '응답 유효 시간은 5분 이상이어야 합니다.';
     if ((toMin(o.we) - toMin(o.ws)) / o.n <= o.gap) return '시간대가 짧거나 프롬프트가 많아 최소 간격을 지킬 수 없습니다. 간격이나 횟수를 줄이세요.';
     if (o.gap < o.expiry) return '최소 간격은 응답 유효 시간 이상이어야 합니다.';
+    if (o.morning && o.n > 1 && (toMin(o.we) - toMin(o.ws) - MORNING_MIN) / (o.n - 1) <= o.gap) return '아침 프롬프트를 고정하면 남은 시간대가 짧아 최소 간격을 지킬 수 없습니다. 간격이나 횟수를 줄이세요.';
+    if (o.morning && toMin(o.we) - toMin(o.ws) < MORNING_MIN) return '응답 시간대가 1시간보다 짧으면 아침 프롬프트를 고정할 수 없습니다.';
   }
+  if (o.pre && !httpsUrl(o.pre)) return '사전 설문 주소는 https:// 로 시작하는 전체 주소여야 합니다.';
+  if (o.post && !httpsUrl(o.post)) return '사후 설문 주소는 https:// 로 시작하는 전체 주소여야 합니다.';
   return '';
 }
 
@@ -262,6 +286,9 @@ function parseConfig(code) {
       n: Number(c.n) || 5, gap: Number(c.gap) || 0, expiry: Number(c.expiry) || 30,
       health: !!c.health, healthTypes: (Array.isArray(c.healthTypes) ? c.healthTypes : []).filter(k => HEALTH_TYPES[k]),
       chat: !!c.chat, chatContent: CHAT_MODES[c.chatContent] ? c.chatContent : 'none',
+      chatPick: CHAT_PICK[c.chatPick] ? c.chatPick : 'all',
+      sleepq: !!c.sleepq, morning: !!c.morning && !!c.prompts,
+      pre: httpsUrl(c.pre), post: httpsUrl(c.post),
       pid: cleanCode(c.pid),
     };
     o.opt = (Array.isArray(c.opt) ? c.opt : []).filter(k => OPTIONAL_KEYS.includes(k) && o[k]);
@@ -284,10 +311,11 @@ function configSummary(o, who) {
     : `오늘 ${fmtDay(start)}부터 ${fmtDay(end)}까지 (${o.days}일)`;
   const tag = k => (who !== 'researcher' ? '' : (o.opt || []).includes(k) ? ' [선택: 참가자가 끌 수 있음]' : ' [필수]');
   const collect = ['자기보고 설문 응답과 응답 시각 (기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모)' + (who === 'researcher' ? ' [필수]' : '')];
+  if (o.sleepq) collect.push('어젯밤 수면: 잠든 시각 · 일어난 시각 · 수면의 질 (그날 첫 응답에서 한 번)' + (who === 'researcher' ? ' [필수]' : ''));
   const perms = [];
-  if (o.prompts) { collect.push(`무작위 프롬프트 일정 (하루 ${o.n || '?'}회, ${o.ws}–${o.we})` + tag('prompts')); perms.push('알림 (프롬프트 시각을 알리기 위해)'); }
+  if (o.prompts) { collect.push(`무작위 프롬프트 일정 (하루 ${o.n || '?'}회, ${o.ws}–${o.we}${o.morning ? ', 첫 프롬프트는 시작 후 1시간 안' : ''})` + tag('prompts')); perms.push('알림 (프롬프트 시각을 알리기 위해)'); }
   if (o.health) collect.push(`건강 일별 요약: ${o.healthTypes.map(k => HEALTH_TYPES[k].label).join(', ') || '없음'} — 직접 고른 내보내기 파일에서 추출` + tag('health'));
-  if (o.chat) collect.push(`고른 AI 대화의 ${CHAT_MODES[o.chatContent]} — 직접 고른 내보내기 파일에서 추출` + tag('chat'));
+  if (o.chat) collect.push(`AI 대화 기록 — 대상: ${CHAT_PICK[o.chatPick || 'all']} / 저장: ${CHAT_MODES[o.chatContent]} — 직접 고른 내보내기 파일에서 추출` + tag('chat'));
   return `
     <dl>
       <dt>기간</dt><dd>${esc(period)}. 이 기간 밖의 데이터는 기록하거나 가져오지 않습니다.</dd>
@@ -295,6 +323,7 @@ function configSummary(o, who) {
       <dt>요청 권한</dt><dd>${perms.length ? perms.map(esc).join(', ') : '없음'}</dd>
       <dt>저장 위치</dt><dd>이 기기의 브라우저 저장소에만. 서버로 전송하지 않습니다.</dd>
       <dt>전달</dt><dd>자동 전송 없음. 연구가 끝난 뒤 내보내기 화면에서 직접 파일을 보낼 때만 연구자에게 전달됩니다.</dd>
+      ${o.pre || o.post ? `<dt>별도 설문</dt><dd>${[o.pre && '시작할 때 사전 설문', o.post && '끝날 때 사후 설문'].filter(Boolean).join(', ')}으로 이동하는 링크를 안내합니다. 설문은 이 앱 밖에서 진행되며 앱은 응답을 저장하지 않습니다.</dd>` : ''}
       <dt>종료 후</dt><dd>기록 · 알림 중단 → 내보내기 → 24시간 뒤 기기 안 데이터 자동 삭제</dd>
       ${who === 'participant' && o.pid ? `<dt>참가자 코드</dt><dd><b>${esc(o.pid)}</b> (보내는 파일에 표시됩니다)</dd>` : ''}
     </dl>`;
@@ -313,6 +342,9 @@ async function startStudy(o) {
     window: { start: o.ws, end: o.we }, promptsPerDay: o.n, minGapMin: o.gap, expiryMin: o.expiry,
     modules: { survey: true, prompts: o.prompts, health: o.health, chat: o.chat },
     healthTypes: o.health ? o.healthTypes : [], chatContent: o.chat ? o.chatContent : 'none',
+    chatPick: o.chatPick || 'all', chatExcluded: {},
+    sleepItems: !!o.sleepq, morningFirst: !!(o.prompts && o.morning),
+    preUrl: o.pre || '', postUrl: o.post || '', preDoneAt: null, postDoneAt: null,
     optionalItems: o.opt || [], declinedItems: o.declined || [],
     exportedAt: null, autoDelete: true,
   };
@@ -393,13 +425,13 @@ function renderJoin(code) {
     ${install}
     <form id="join" class="card">
       <h2>기록 항목</h2>
-      <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b> <span class="chip">필수</span><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모</small></div></label>
+      <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b> <span class="chip">필수</span><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모${o.sleepq ? ' · 그날 첫 응답에서 어젯밤 수면(잠든 시각, 일어난 시각, 수면의 질)' : ''}</small></div></label>
       ${OPTIONAL_KEYS.filter(k => o[k]).map(k => {
         const optional = o.opt.includes(k);
         const info = {
           prompts: ['랜덤 알림 프롬프트', `하루 ${o.n}회, ${o.ws}–${o.we} 사이 무작위 시각에 응답 요청. 알림 권한을 요청합니다.`],
           health: ['건강 데이터', `${o.healthTypes.map(t => HEALTH_TYPES[t].label).join(', ')}의 일별 요약. 직접 고른 내보내기 파일에서만 추출합니다.`],
-          chat: ['AI 채팅 사용기록', `직접 고른 대화의 ${CHAT_MODES[o.chatContent]}.`],
+          chat: ['AI 채팅 사용기록', `대상: ${CHAT_PICK[o.chatPick]}. 저장: ${CHAT_MODES[o.chatContent]}.`],
         }[k];
         return `<label class="opt"><input type="checkbox" name="m_${k}" checked ${optional ? '' : 'disabled'}><div><b>${info[0]}</b> <span class="chip ${optional ? 'ok' : ''}">${optional ? '선택' : '필수'}</span><small>${esc(info[1])}${optional ? ' 원하지 않으면 체크를 해제하세요.' : ''}</small></div></label>`;
       }).join('')}
@@ -445,15 +477,24 @@ function renderResearcher() {
     <section class="card">
       <h2><span class="num">1</span>기록할 항목</h2>
       <label class="opt"><input type="checkbox" checked disabled><div><b>자기보고 설문</b><small>기분 · 스트레스 · 피로 · 하는 일 · 함께 있는 사람 · 메모. 권한 필요 없음 (필수)</small></div></label>
+      <div class="sub"><label class="chk full"><input type="checkbox" name="sleepq" checked> 아침 수면 문항 추가 (그날 첫 응답에서 잠든 시각 · 일어난 시각 · 수면의 질)</label></div>
       <label class="opt"><input type="checkbox" name="prompts" checked><div><b>랜덤 알림 프롬프트</b><small>하루 몇 번 무작위 시간에 응답을 요청합니다. 참가자에게 <em>알림 권한</em>을 요청합니다.</small></div></label>
-      <div class="sub" data-when="prompts"><label class="chk"><input type="checkbox" name="opt_prompts"> 선택 항목으로 (참가자가 끌 수 있음)</label></div>
+      <div class="sub" data-when="prompts">
+        <label class="chk full"><input type="checkbox" name="morning" checked> 하루 첫 프롬프트는 응답 시간대 시작 후 1시간 안에 (아침 응답 확보)</label>
+        <label class="chk full"><input type="checkbox" name="opt_prompts"> 선택 항목으로 (참가자가 끌 수 있음)</label>
+      </div>
       <label class="opt"><input type="checkbox" name="health"><div><b>건강 데이터</b><small>iPhone 건강 앱 또는 Android(Google Fit · 삼성 헬스)의 '내보내기' 파일에서 연구 기간 안의 <em>일별 요약</em>만 추출합니다.</small></div></label>
       <div class="sub" data-when="health">
         ${Object.entries(HEALTH_TYPES).map(([k, t]) => `<label class="chk"><input type="checkbox" name="ht_${k}" ${k !== 'heart' ? 'checked' : ''}> ${t.label}</label>`).join('')}
         <label class="chk full"><input type="checkbox" name="opt_health"> 선택 항목으로 (참가자가 끌 수 있음)</label>
       </div>
-      <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 <em>참가자가 고른 대화</em>의 기간 내 메시지만 남깁니다.</small></div></label>
+      <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 연구 기간 안의 메시지만 남깁니다.</small></div></label>
       <div class="sub" data-when="chat">
+        <p class="subhead">가져올 대화</p>
+        <label class="opt"><input type="radio" name="chatPick" value="all" checked><div><b>기간 안 모든 대화</b><small>참가자가 고르지 않고, 파일에 있는 기간 안 메시지를 전부 저장합니다 (권장).</small></div></label>
+        <label class="opt"><input type="radio" name="chatPick" value="exclude"><div><b>모든 대화, 일부 제외 가능</b><small>참가자가 특정 대화를 뺄 수 있고, 제외한 대화 수와 메시지 수가 기록됩니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatPick" value="pick"><div><b>참가자가 고른 대화만</b><small>무엇을 뺐는지 알 수 없어 사용 비율 분석에는 맞지 않습니다.</small></div></label>
+        <p class="subhead">저장할 내용</p>
         <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>시각 · 글자 수만 저장 (본문 제외)</b><small>메시지마다 보낸 시각, 발화자(나/AI), 글자 수를 저장합니다.</small></div></label>
         <label class="opt"><input type="radio" name="chatContent" value="user"><div><b>참가자가 보낸 메시지 본문만 저장</b><small>AI의 답변은 본문 없이 시각 · 글자 수만 저장합니다. 대화 제목은 저장하지 않습니다.</small></div></label>
         <label class="opt"><input type="radio" name="chatContent" value="all"><div><b>모든 본문과 대화 제목 저장</b><small>참가자 메시지와 AI 답변의 본문, 대화 제목까지 저장합니다.</small></div></label>
@@ -481,7 +522,10 @@ function renderResearcher() {
       <div class="grid">
         <label>연구 이름 (선택)<input type="text" name="name" maxlength="80" placeholder="예: AI 사용과 일상 기분 연구"></label>
         <label>연구자 · 문의처 (선택)<input type="text" name="contact" maxlength="120" placeholder="예: 홍길동, 연구실 메일"></label>
+        <label>사전 설문 주소 (선택)<input type="url" name="pre" maxlength="300" placeholder="https://…" autocapitalize="off" spellcheck="false"></label>
+        <label>사후 설문 주소 (선택)<input type="url" name="post" maxlength="300" placeholder="https://…" autocapitalize="off" spellcheck="false"></label>
       </div>
+      <p class="hint">설문 주소를 넣으면 참가자에게 시작할 때(사전)와 끝난 뒤(사후) 그 링크를 안내하고, 설문에 적을 참가자 코드를 함께 보여 줍니다. 설문 응답은 앱에 저장되지 않으니 설문에 참가자 코드 문항을 넣어 두세요.</p>
     </section>
 
     <section class="card">
@@ -513,7 +557,9 @@ function renderResearcher() {
     prompts: v('prompts').checked, ws: v('ws').value, we: v('we').value, n: parseInt(v('n').value, 10),
     gap: parseInt(v('gap').value, 10), expiry: parseInt(v('expiry').value, 10),
     health: v('health').checked, healthTypes: Object.keys(HEALTH_TYPES).filter(k => v('ht_' + k).checked),
-    chat: v('chat').checked, chatContent: v('chatContent').value,
+    chat: v('chat').checked, chatContent: v('chatContent').value, chatPick: v('chatPick').value,
+    sleepq: v('sleepq').checked, morning: v('prompts').checked && v('morning').checked,
+    pre: v('pre').value.trim(), post: v('post').value.trim(),
     opt: OPTIONAL_KEYS.filter(k => v(k).checked && v('opt_' + k).checked),
   });
   const codes = () => [...new Set(v('codes').value.split(/[,;\n]+/).map(cleanCode).filter(Boolean))];
@@ -537,7 +583,10 @@ function renderResearcher() {
     const list = codes();
     if (!list.length) return toast('참가자 코드를 하나 이상 입력하세요.');
     const { fixed, ...cfg } = o;
-    if (!cfg.prompts) { delete cfg.ws; delete cfg.we; delete cfg.n; delete cfg.gap; delete cfg.expiry; }
+    if (!cfg.prompts) { delete cfg.ws; delete cfg.we; delete cfg.n; delete cfg.gap; delete cfg.expiry; delete cfg.morning; }
+    if (!cfg.chat) { delete cfg.chatContent; delete cfg.chatPick; }
+    cfg.pre = httpsUrl(cfg.pre); cfg.post = httpsUrl(cfg.post);
+    for (const k of ['pre', 'post', 'name', 'contact']) if (!cfg[k]) delete cfg[k];
     cfg.sid = 'S' + hashStr(JSON.stringify(cfg)).toString(36).toUpperCase();   // same settings -> same study code
     const base = location.origin + location.pathname + '#j=';
     const rows = list.map(pid => ({ pid, url: base + b64enc({ ...cfg, pid }) }));
@@ -564,6 +613,23 @@ function renderResearcher() {
     };
     $('#links').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
+}
+
+/* ---------- pre / post survey links (the surveys themselves live outside the app) ---------- */
+function surveyCard() {
+  const ph = phase();
+  const kind = ph === 'ended' ? (study.postUrl && !study.postDoneAt ? 'post' : '') : (study.preUrl && !study.preDoneAt ? 'pre' : '');
+  if (!kind) return '';
+  const url = kind === 'pre' ? study.preUrl : study.postUrl;
+  return `
+    <section class="card notice">
+      <h2>${kind === 'pre' ? '먼저 사전 설문을 해 주세요' : '마지막으로 사후 설문을 해 주세요'}</h2>
+      <p>설문은 새 창에서 열립니다.${study.participantId ? ` 내 참가자 코드는 <b>${esc(study.participantId)}</b>입니다. 설문의 참가자 코드 칸에 그대로 적어 주세요.` : ''}</p>
+      <div class="row wrap">
+        <a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${kind === 'pre' ? '사전' : '사후'} 설문 열기</a>
+        <button class="btn" data-act="${kind}-done">설문을 마쳤어요</button>
+      </div>
+    </section>`;
 }
 
 /* ---------- home ---------- */
@@ -620,6 +686,7 @@ async function viewHome() {
   }).join('');
 
   return `
+    ${surveyCard()}
     ${open && ph === 'active' ? `<section class="card alert"><div><b>지금 응답할 수 있어요</b><small>${hm(new Date(open.at))} 프롬프트 · ${hm(new Date(open.at + study.expiryMin * 60000))}까지</small></div><a class="btn primary" href="#survey">응답하기</a></section>` : ''}
     <section class="card">${status}</section>
     <section class="stats">
@@ -652,10 +719,22 @@ async function viewSurvey() {
       <input type="range" name="${name}" min="${min}" max="${max}" value="${val}" step="1">
       <div class="ends"><span>${lo}</span><span>${hi}</span></div></fieldset>`;
   const chips = (name, list) => `<div class="chips">${list.map(x => `<label><input type="radio" name="${name}" value="${esc(x)}"><span>${esc(x)}</span></label>`).join('')}</div>`;
+  // Sleep is asked once a day, on the first response of that day.
+  const today = dayKey(new Date());
+  const needSleep = study.sleepItems && !(await DB.all('responses')).some(r => r.bedTime && dayKey(new Date(r.ts)) === today);
+  const sleepBlock = needSleep ? `
+      <fieldset class="sleepq"><legend>어젯밤 수면 <span class="chip">오늘 첫 응답에서만</span></legend>
+        <div class="grid">
+          <label>잠든 시각<input type="time" name="bedTime" required></label>
+          <label>일어난 시각<input type="time" name="wakeTime" required></label>
+        </div>
+      </fieldset>
+      ${scale('sleepQuality', '수면의 질', 0, 10, '매우 나쁨', '매우 좋음', 5)}` : '';
   return `
     <form id="survey" class="card" data-prompt="${open ? open.id : ''}" data-prompt-at="${open ? open.at : ''}">
       <h2>${open ? `${hm(new Date(open.at))} 프롬프트 응답` : '직접 기록'}</h2>
-      <p class="muted">지금 이 순간을 기준으로 답해 주세요.</p>
+      ${sleepBlock}
+      <p class="muted"${needSleep ? ' style="margin-top:20px"' : ''}>${needSleep ? '아래는 ' : ''}지금 이 순간을 기준으로 답해 주세요.</p>
       ${scale('mood', '기분', 1, 7, '매우 나쁨', '매우 좋음', 4)}
       ${scale('stress', '스트레스', 0, 10, '전혀 없음', '매우 높음', 5)}
       ${scale('fatigue', '피로', 0, 10, '전혀 없음', '매우 높음', 5)}
@@ -723,18 +802,20 @@ async function viewData() {
       c.first = Math.min(c.first, e.ts); c.last = Math.max(c.last, e.ts);
     }
     const list = Object.values(convs);
+    const excludedN = Object.keys(study.chatExcluded || {}).length;
+    const excludedM = Object.values(study.chatExcluded || {}).reduce((s, n) => s + n, 0);
     blocks.push(`
       <section class="card">
         <h2>AI 채팅 사용기록</h2>
-        <p class="muted">가져오는 범위: <b>${range}</b> · 저장 내용: <b>${CHAT_MODES[chatMode()]}</b></p>
+        <p class="muted">가져오는 범위: <b>${range}</b> · 대상: <b>${CHAT_PICK[chatPick()]}</b> · 저장 내용: <b>${CHAT_MODES[chatMode()]}</b></p>
         <details><summary>내보내기 파일 받는 법</summary>
           <ul class="steps"><li><b>ChatGPT</b>: 설정 → 데이터 제어 → 데이터 내보내기 → 메일로 받은 zip 안의 <code>conversations.json</code></li>
           <li><b>Claude</b>: 설정 → 개인정보 → 데이터 내보내기 → 받은 zip 안의 <code>conversations.json</code></li></ul>
-          <p class="hint">파일을 열면 연구 기간 안에 메시지가 있는 대화 목록만 보여 줍니다. 체크한 대화만 저장하고 나머지는 메모리에서 바로 버립니다.</p>
+          <p class="hint">파일을 열면 연구 기간 안에 메시지가 있는 대화만 추립니다. 기간 밖 메시지와 저장하지 않는 대화는 메모리에서 바로 버립니다. 여러 AI를 썼다면 파일을 하나씩 차례로 가져오세요.</p>
         </details>
         ${locked ? '<p class="chip">연구 시작 후 가져올 수 있습니다</p>' : '<label class="file">conversations.json 선택<input type="file" accept=".json,application/json" data-act="chat-file"></label>'}
         <div id="chatPick"></div>
-        ${list.length ? `<ul class="convs">${list.map(c => `<li><div><b>${esc(c.label)}</b><small>${c.source === 'claude' ? 'Claude' : 'ChatGPT'} · 메시지 ${c.n}개 (내가 보낸 것 ${c.user}) · ${fmtDT(c.first)} – ${fmtDT(c.last)}</small></div><button class="btn small ghost" data-act="chat-remove" data-key="${esc(c.key)}">삭제</button></li>`).join('')}</ul>` : '<p class="muted">아직 저장한 대화가 없습니다.</p>'}
+        ${list.length ? `<ul class="convs">${list.map(c => `<li><div><b>${esc(c.label)}</b><small>${c.source === 'claude' ? 'Claude' : 'ChatGPT'} · 메시지 ${c.n}개 (내가 보낸 것 ${c.user}) · ${fmtDT(c.first)} – ${fmtDT(c.last)}</small></div>${chatPick() === 'all' ? '' : `<button class="btn small ghost" data-act="chat-remove" data-key="${esc(c.key)}">${chatPick() === 'exclude' ? '제외' : '삭제'}</button>`}</li>`).join('')}</ul>${excludedN ? `<p class="hint">제외한 대화 ${excludedN}개 (메시지 ${excludedM}개) — 개수만 기록됩니다.</p>` : ''}` : '<p class="muted">아직 저장한 대화가 없습니다.</p>'}
       </section>`);
   }
   return blocks.join('');
@@ -749,19 +830,29 @@ async function handleChatFile(file) {
     .filter(c => c.messages.length)
     .sort((a, b) => b.messages[b.messages.length - 1].ts - a.messages[a.messages.length - 1].ts);
   pendingChat = inWin;
+  const pick = chatPick();
   const box = $('#chatPick');
   if (!inWin.length) { box.innerHTML = `<p class="chip warn">파일의 대화 ${convs.length}개 중 연구 기간 안에 메시지가 있는 대화가 없습니다.</p>`; return; }
   box.innerHTML = `
     <form id="chatForm" class="pick">
-      <p><b>저장할 대화를 고르세요</b> <span class="muted">(기간 안 대화 ${inWin.length}개 / 전체 ${convs.length}개)</span></p>
-      <ul>${inWin.map((c, i) => `<li><label><input type="checkbox" name="c" value="${i}"><div><b>${esc(c.title)}</b><small>${c.source === 'claude' ? 'Claude' : 'ChatGPT'} · 기간 내 메시지 ${c.messages.length}개 · 마지막 ${fmtDT(c.messages[c.messages.length - 1].ts)}</small></div></label></li>`).join('')}</ul>
-      <p class="hint">제목은 고르는 데만 보여 주며, ${chatMode() === 'all' ? '모든 본문 저장이 켜져 있어 제목도 함께 저장합니다.' : '저장하지 않습니다 ("대화 1"처럼 번호로 저장).'}</p>
-      <div class="row"><button class="btn primary" type="submit">선택한 대화 저장</button><button class="btn ghost" type="button" data-act="chat-cancel">취소</button></div>
+      <p><b>${{ all: '기간 안의 모든 대화를 저장합니다', exclude: '기간 안의 모든 대화를 저장합니다. 빼고 싶은 대화는 체크를 해제하세요', pick: '저장할 대화를 고르세요' }[pick]}</b> <span class="muted">(기간 안 대화 ${inWin.length}개, 메시지 ${inWin.reduce((s, c) => s + c.messages.length, 0)}개 / 파일 전체 대화 ${convs.length}개)</span></p>
+      <ul>${inWin.map((c, i) => `<li><label><input type="checkbox" name="c" value="${i}" ${pick === 'pick' ? '' : 'checked'} ${pick === 'all' ? 'disabled' : ''}><div><b>${esc(c.title)}</b><small>${c.source === 'claude' ? 'Claude' : 'ChatGPT'} · 기간 내 메시지 ${c.messages.length}개 · 마지막 ${fmtDT(c.messages[c.messages.length - 1].ts)}</small></div></label></li>`).join('')}</ul>
+      <p class="hint">${pick === 'exclude' ? '제외한 대화는 내용 없이 개수와 메시지 수만 기록됩니다. ' : ''}제목은 확인하는 데만 보여 주며, ${chatMode() === 'all' ? '모든 본문 저장이 켜져 있어 제목도 함께 저장합니다.' : '저장하지 않습니다 ("대화 1"처럼 번호로 저장).'}</p>
+      <div class="row"><button class="btn primary" type="submit">${pick === 'all' ? '모두 저장' : '선택한 대화 저장'}</button><button class="btn ghost" type="button" data-act="chat-cancel">취소</button></div>
     </form>`;
   $('#chatForm').addEventListener('submit', async e => {
     e.preventDefault();
     const picked = $$('input[name=c]:checked', e.target).map(x => pendingChat[+x.value]);
-    if (!picked.length) { toast('대화를 하나 이상 고르세요.'); return; }
+    if (!picked.length && pick !== 'exclude') { toast('대화를 하나 이상 고르세요.'); return; }
+    if (pick === 'exclude') {   // remember how much was left out (ids and counts only, never content)
+      const keep = new Set(picked.map(c => `${c.source}:${c.id}`));
+      study.chatExcluded = study.chatExcluded || {};
+      for (const c of pendingChat) {
+        const key = `${c.source}:${c.id}`;
+        if (keep.has(key)) delete study.chatExcluded[key]; else study.chatExcluded[key] = c.messages.length;
+      }
+      await saveStudy();
+    }
     const mode = chatMode();
     const existing = await DB.all('chat');
     const labels = new Map(existing.map(x => [x.convKey, x.convLabel]));
@@ -792,6 +883,7 @@ async function viewExport() {
   const [responses, prompts, health, chat] = await Promise.all(['responses', 'prompts', 'health', 'chat'].map(s => DB.all(s)));
   const delAt = study.exportedAt ? study.exportedAt + DELETE_GRACE_MS : null;
   return `
+    ${ph === 'ended' ? surveyCard() : ''}
     ${ph === 'ended' ? `<section class="card ${study.exportedAt ? '' : 'alert'}">
       <div><b>${study.exportedAt ? '내보내기 완료' : '연구가 끝났습니다 — 데이터를 내보내세요'}</b>
       <small>${study.exportedAt
@@ -837,7 +929,9 @@ async function exportData(kind) {
   const base = `ema-${pid ? pid + '-' : ''}`;
   const withPid = rows => (pid ? rows.map(r => ({ participant: pid, ...r })) : rows);
   const cols = list => (pid ? ['participant', ...list] : list);
-  const { id, createdAt, consentAt, ...cfg } = study;
+  const { id, createdAt, consentAt, chatExcluded, ...cfg } = study;
+  cfg.chatExcludedConversations = Object.keys(chatExcluded || {}).length;
+  cfg.chatExcludedMessages = Object.values(chatExcluded || {}).reduce((s, n) => s + n, 0);
   const jsonFile = {
     name: `${base}${stamp}.json`, type: 'application/json',
     text: JSON.stringify({
@@ -846,7 +940,7 @@ async function exportData(kind) {
       responses: respRows, prompts: promptRows, health: health.sort((a, b) => a.date.localeCompare(b.date)), chat: chatRows,
     }, null, 2),
   };
-  const csvFiles = [{ name: `${base}responses-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(respRows), cols(['id', 'ts', 'promptId', 'promptAt', 'latencySec', 'mood', 'stress', 'fatigue', 'activity', 'social', 'note'])) }];
+  const csvFiles = [{ name: `${base}responses-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(respRows), cols(['id', 'ts', 'promptId', 'promptAt', 'latencySec', 'mood', 'stress', 'fatigue', 'activity', 'social', 'note', ...(study.sleepItems ? ['bedTime', 'wakeTime', 'sleepMin', 'sleepQuality'] : [])])) }];
   if (study.modules.prompts) csvFiles.push({ name: `${base}prompts-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(promptRows), cols(['id', 'date', 'at', 'status'])) });
   if (study.modules.health) csvFiles.push({ name: `${base}health-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(health), cols(['date', 'steps', 'sleepMin', 'hrAvg', 'hrMin', 'hrMax', 'manual'])) });
   if (study.modules.chat) csvFiles.push({ name: `${base}chat-${stamp}.csv`, type: 'text/csv', text: toCSV(withPid(chatRows), cols(['ts', 'source', 'convLabel', 'role', 'chars', 'words', ...(chatMode() !== 'none' ? ['text'] : [])])) });
@@ -900,11 +994,17 @@ function bindView(v) {
       download('ema-prompts.ics', buildICS(future), 'text/calendar');
     } else if (act === 'chat-remove') {
       const key = btn.dataset.key;
-      if (!confirm('이 대화의 저장된 기록을 삭제할까요?')) return;
-      await DB.delMany('chat', (await DB.all('chat')).filter(x => x.convKey === key).map(x => x.id));
+      if (chatPick() === 'all') return;
+      if (!confirm(chatPick() === 'exclude' ? '이 대화를 제외할까요? 제외했다는 사실과 메시지 수는 기록됩니다.' : '이 대화의 저장된 기록을 삭제할까요?')) return;
+      const gone = (await DB.all('chat')).filter(x => x.convKey === key);
+      await DB.delMany('chat', gone.map(x => x.id));
+      if (chatPick() === 'exclude') { study.chatExcluded = { ...(study.chatExcluded || {}), [key]: gone.length }; await saveStudy(); }
       render();
     } else if (act === 'chat-cancel') {
       pendingChat = null; $('#chatPick').innerHTML = '';
+    } else if (act === 'pre-done' || act === 'post-done') {
+      study[act === 'pre-done' ? 'preDoneAt' : 'postDoneAt'] = Date.now();
+      await saveStudy(); render();
     } else if (act === 'export-share') exportData('share');
     else if (act === 'export-json') exportData('json');
     else if (act === 'export-csv') exportData('csv');
@@ -950,11 +1050,17 @@ function bindView(v) {
       let promptId = f.dataset.prompt || null;
       let promptAt = f.dataset.promptAt ? Number(f.dataset.promptAt) : null;
       if (promptId && now >= promptAt + study.expiryMin * 60000) { promptId = null; promptAt = null; } // expired while filling
-      await DB.put('responses', {
+      const rec = {
         id: uid(), ts: now, promptId, promptAt, latencySec: promptAt ? Math.round((now - promptAt) / 1000) : null,
         mood: +fd.get('mood'), stress: +fd.get('stress'), fatigue: +fd.get('fatigue'),
         activity: fd.get('activity') || '', social: fd.get('social') || '', note: (fd.get('note') || '').trim(),
-      });
+      };
+      if (f.elements.bedTime) {
+        const bed = fd.get('bedTime'), wake = fd.get('wakeTime');
+        if (!bed || !wake) return toast('잠든 시각과 일어난 시각을 입력해 주세요.');
+        Object.assign(rec, { bedTime: bed, wakeTime: wake, sleepMin: (toMin(wake) - toMin(bed) + 1440) % 1440, sleepQuality: +fd.get('sleepQuality') });
+      }
+      await DB.put('responses', rec);
       toast('저장했습니다.');
       location.hash = 'home';
     });
