@@ -231,7 +231,7 @@ function renderSetup() {
       </div>
       <label class="opt"><input type="checkbox" name="chat"><div><b>지정한 AI 채팅 사용기록</b><small>ChatGPT · Claude 데이터 내보내기 파일에서 <em>내가 고른 대화</em>의 기간 내 메시지만 남깁니다.</small></div></label>
       <div class="sub" data-when="chat">
-        <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>본문 저장 안 함</b><small>시각 · 발화자(나/AI) · 글자 수만 저장합니다.</small></div></label>
+        <label class="opt"><input type="radio" name="chatContent" value="none" checked><div><b>시각 · 글자 수만 저장 (본문 제외)</b><small>메시지마다 보낸 시각, 발화자(나/AI), 글자 수를 저장합니다. 본문과 대화 제목은 저장하지 않습니다.</small></div></label>
         <label class="opt"><input type="radio" name="chatContent" value="user"><div><b>내가 보낸 메시지 본문만 저장</b><small>AI의 답변은 본문 없이 시각 · 글자 수만 저장합니다. 대화 제목은 저장하지 않습니다.</small></div></label>
         <label class="opt"><input type="radio" name="chatContent" value="all"><div><b>모든 본문과 대화 제목 저장</b><small>내 메시지와 AI 답변의 본문, 대화 제목까지 저장합니다.</small></div></label>
       </div>
